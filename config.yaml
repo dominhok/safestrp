@@ -4,6 +4,37 @@ model:
   num_classes: 21  # for segmentation
   detection_heads: 1
   depth_estimation: true
+  num_detection_classes: 21 # Example: 20 object classes + 1 background
+  anchors_per_location_list: [4, 6, 6, 6, 4, 4] # Example, ensure consistent with model
+
+  anchors:
+    # feature_map_sizes will be derived from image_size and feature_strides
+    # image_size will be taken from data.image_size: [1024, 512] (W, H), so AnchorGenerator expects (H, W) -> (512, 1024)
+    feature_strides: [8, 16, 32, 64, 128, 256] # Strides for ['res3_reduced', 'res4_reduced', 'extra1', 'extra2', 'extra3', 'extra4']
+
+    # min_sizes_abs and max_sizes_abs are inspired by the SSD paper (s_k) and anchors.py test logic
+    # The following are example absolute pixel values for an image with shorter side 512px
+    # s_min_ratio = 0.10, s_max_ratio = 0.90, num_feature_maps = 6
+    # Scales: s_k = s_min + (s_max - s_min) * (k-1) / (m-1)
+    # Example values for shorter_side=512:
+    # min_sizes_abs: [51.2, 102.4, 153.6, 204.8, 256.0, 307.2] # Placeholder, review and adjust
+    # max_sizes_abs is used for the s'_k = sqrt(s_k * s_{k+1}) anchor.
+    # This should correspond to the *next* layer's min_size, or a bit larger for the last layer.
+    # Example: [102.4, 153.6, 204.8, 256.0, 307.2, 322.56] # Placeholder, review and adjust
+    min_sizes_abs: [51, 102, 153, 204, 256, 307] # Rounded for simplicity
+    max_sizes_abs: [102, 153, 204, 256, 307, 322] # Rounded for simplicity
+                                                # Last one is approx. 307 * 1.05
+
+    aspect_ratios: # Aspect ratios (excluding 1.0 which is handled) for each feature map level
+                   # These lists result in [4, 6, 6, 6, 4, 4] anchors per location when combined with defaults
+      - [2.0, 0.5]
+      - [2.0, 0.5, 3.0, 0.3333333333333333] # 1.0/3.0
+      - [2.0, 0.5, 3.0, 0.3333333333333333]
+      - [2.0, 0.5, 3.0, 0.3333333333333333]
+      - [2.0, 0.5]
+      - [2.0, 0.5]
+    clip: true
+    variances: [0.1, 0.1, 0.2, 0.2] # For SSD box encoding/decoding
 
 training:
   batch_size: 8
@@ -25,3 +56,25 @@ logging:
   log_interval: 100
   save_interval: 1  # save model every N epochs
   tensorboard: true 
+
+# NEW loss configuration section
+loss:
+  weights:
+    detection: 1.0       # Weight for the total detection loss (cls + loc)
+    segmentation: 1.0    # Weight for the segmentation loss
+    depth: 1.0           # Weight for the depth estimation loss
+  
+  focal_loss:  # Parameters for FocalLoss used in ObjectDetectionLoss
+    alpha: 0.25
+    gamma: 2.0
+  
+  smooth_l1_beta: 1.0      # Beta parameter for SmoothL1Loss in ObjectDetectionLoss (for localization)
+  
+  # SILog loss parameters (if you decide to use SILogLoss for dense depth maps later)
+  silog:
+    variance_focus: 0.85
+  
+  # Segmentation loss specific parameters
+  segmentation_class_weights: null  # Example: [0.5, 1.2, 1.0, 0.8] for 4 classes. Set to null or omit for no specific weighting.
+                                    # Length must match model.num_classes (for segmentation)
+  segmentation_ignore_index: -100   # Label index to ignore in segmentation loss calculation 

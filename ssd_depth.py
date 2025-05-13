@@ -11,38 +11,6 @@ def conv_unit(in_channels, mid_channels, out_channels, stride_3x3=1):
         nn.ReLU(inplace=True)
     )
 
-# 2. ResNetBackbone Implementation
-class ResNetBackbone(nn.Module):
-    def __init__(self, pretrained=True):
-        super().__init__()
-        if pretrained:
-            weights = models.ResNet50_Weights.IMAGENET1K_V1
-        else:
-            weights = None
-        resnet = models.resnet50(weights=weights)
-
-        # Remove fully connected layer and average pooling
-        self.conv1 = resnet.conv1
-        self.bn1 = resnet.bn1
-        self.relu = resnet.relu
-        self.maxpool = resnet.maxpool
-
-        self.layer1 = resnet.layer1 # conv2_x
-        self.layer2 = resnet.layer2 # conv3_x
-        self.layer3 = resnet.layer3 # conv4_x -> res3_x for DSPNet (1024 channels)
-        self.layer4 = resnet.layer4 # conv5_x -> res4_x for DSPNet (2048 channels)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        res3_x_feat = self.layer3(x)       # Output of ResNet layer3 (e.g., H/16, W/16, 1024 channels)
-        res4_x_feat = self.layer4(res3_x_feat) # Output of ResNet layer4 (e.g., H/32, W/32, 2048 channels)
-        return res3_x_feat, res4_x_feat
 
 # SSDDecoder class is removed/commented out as its logic is integrated into DSPNet_Detector
 # class SSDDecoder(nn.Module):

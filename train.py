@@ -15,10 +15,12 @@ from torch.optim.lr_scheduler import MultiStepLR
 from projects.safestrp.resnet_backbone import ResNetBackbone
 from projects.safestrp.ssd_depth import DSPNet_Detector
 from projects.safestrp.dspnet_seg import DSPNetSegmentationHead
+# Import custom loss functions
+from projects.safestrp.losses import SegmentationLoss, ObjectDetectionLoss, SILogLoss # MODIFIED
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Multi-task Learning Training')
-    parser.add_argument('--config', type=str, default='projects/safestrp/config.yaml', help='Path to config file') # Default path updated
+    parser.add_argument('--config', type=str, default='projects/safestrp/config.yaml', help='Path to config file')
     parser.add_argument('--resume', action='store_true', help='Resume training from checkpoint')
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint file')
     return parser.parse_args()
@@ -35,25 +37,16 @@ def create_dataloaders(config):
     if config['training']['batch_size'] > 0 : 
         dummy_images = torch.randn(config['training']['batch_size'], 3, config['data']['image_size'][1], config['data']['image_size'][0])
         
-        # Determine number of anchors based on image size and detector's expected feature map sizes
-        # This is a rough estimation and should be calculated accurately based on model architecture if needed for dummy targets
-        # For res3_reduced (H/8, W/8) e.g., (512/8, 1024/8) = (64, 128)
-        # For res4_reduced (H/16, W/16) e.g., (512/16, 1024/16) = (32, 64)
-        # ... and so on for extra layers.
-        # The value 2476 was for a 320x320 input in an older example. Let's use a more generic placeholder or calculate it.
-        # For simplicity, using a fixed large enough number for dummy target.
-        # A more robust way would be to pass a dummy input through the detector once to get the actual number of anchors.
+        h, w = config['data']['image_size'][1], config['data']['image_size'][0]
+        # Assuming anchors_per_location_list is available and correctly defined
         num_anchors_placeholder = config['model'].get('anchors_per_location_list', [4,6,6,6,4,4])
         
-        # Calculate total anchors based on example image size H=512, W=1024 from config
-        # These are example calculations and might need adjustment based on actual model output shapes
-        h, w = config['data']['image_size'][1], config['data']['image_size'][0]
-        s0_h, s0_w = h // 8, w // 8   # res3_reduced
-        s1_h, s1_w = h // 16, w // 16 # res4_reduced
-        s2_h, s2_w = s1_h // 2, s1_w // 2 # extra_layer1 from res4_reduced
-        s3_h, s3_w = s2_h // 2, s2_w // 2 # extra_layer2
-        s4_h, s4_w = s3_h // 2, s3_w // 2 # extra_layer3
-        s5_h, s5_w = s4_h // 2, s4_w // 2 # extra_layer4
+        s0_h, s0_w = h // 8, w // 8
+        s1_h, s1_w = h // 16, w // 16
+        s2_h, s2_w = s1_h // 2, s1_w // 2
+        s3_h, s3_w = s2_h // 2, s2_w // 2
+        s4_h, s4_w = s3_h // 2, s3_w // 2
+        s5_h, s5_w = s4_h // 2, s4_w // 2
 
         total_anchors = (s0_h * s0_w * num_anchors_placeholder[0]) + \
                         (s1_h * s1_w * num_anchors_placeholder[1]) + \
@@ -62,16 +55,23 @@ def create_dataloaders(config):
                         (s4_h * s4_w * num_anchors_placeholder[4]) + \
                         (s5_h * s5_w * num_anchors_placeholder[5])
 
-        dummy_cls_target = torch.randint(0, config['model'].get('num_detection_classes', 20) + 1, (config['training']['batch_size'], total_anchors)) 
-        dummy_reg_target = torch.rand(config['training']['batch_size'], total_anchors, 5)
+        # For dummy_reg_target, last dimension 5 means (dx, dy, dw, dh, depth_target)
+        # For gt_cls_labels, values are class indices. 0 for background.
+        # num_detection_classes includes background. If config has num_object_classes, add 1.
+        num_det_classes_for_dummy = config['loss'].get('detection_num_classes', config['model'].get('num_detection_classes', 20) + 1)
+
+        dummy_cls_target = torch.randint(0, num_det_classes_for_dummy, (config['training']['batch_size'], total_anchors)) 
+        dummy_box_target = torch.rand(config['training']['batch_size'], total_anchors, 4) # dx, dy, dw, dh
+        dummy_depth_target = torch.rand(config['training']['batch_size'], total_anchors, 1) * 10 # depth
+        
         dummy_seg_target = torch.randint(0, config['model']['num_classes'], (config['training']['batch_size'], config['data']['image_size'][1] // 2, config['data']['image_size'][0] // 2))
         
         dummy_targets = {
-            'cls': dummy_cls_target,
-            'box_and_depth': dummy_reg_target,
+            'detection_cls': dummy_cls_target,
+            'detection_loc': dummy_box_target,
+            'depth': dummy_depth_target, # Associated with anchors for this dummy data
             'segmentation': dummy_seg_target
         }
-        # Ensure num_samples is divisible by batch_size for simplicity in dummy loader
         num_dummy_batches_train = 5 
         num_dummy_batches_val = 2
         train_loader = [(dummy_images, dummy_targets)] * num_dummy_batches_train
@@ -82,81 +82,183 @@ def create_dataloaders(config):
 
     return train_loader, val_loader
 
-def train(backbone, det_depth_model, seg_model, train_loader, optimizer, criterion, device, epoch, writer, config, wseg):
+# MODIFIED train function signature and body
+def train(backbone, det_depth_model, seg_model, train_loader, optimizer, criterion, device, epoch, writer, config):
     backbone.train()
     det_depth_model.train()
     seg_model.train()
-    total_loss = 0
+    
+    epoch_total_loss = 0
+    epoch_det_cls_loss = 0
+    epoch_det_loc_loss = 0
+    epoch_depth_loss = 0
+    epoch_seg_loss = 0
+    
+    loss_weights = config['loss']['weights']
     
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1} [TRAIN]")
     for batch_idx, (images, targets) in enumerate(progress_bar):
         images = images.to(device)
-        targets_cls = targets['cls'].to(device)
-        targets_box_depth = targets['box_and_depth'].to(device)
-        targets_seg = targets['segmentation'].to(device)
+        gt_det_cls = targets['detection_cls'].to(device).long() # Ensure long type for CrossEntropy/FocalLoss
+        gt_det_loc = targets['detection_loc'].to(device)
+        gt_depth = targets['depth'].to(device) # (batch, num_anchors, 1)
+        gt_seg = targets['segmentation'].to(device).long() # Ensure long type
 
-        # resnet_backbone.py returns: res3_reduced, res4_reduced, res5_reduced
         res3_reduced_feat, res4_reduced_feat, res5_reduced_feat = backbone(images)
         
-        # DSPNet_Detector now expects res3_reduced (128ch) and res4_reduced (256ch)
-        det_cls_pred, det_box_depth_pred = det_depth_model(res3_reduced_feat, res4_reduced_feat)
+        # pred_cls_logits: (batch, num_anchors, num_classes)
+        # pred_box_depth: (batch, num_anchors, 5) where last dim is (dx,dy,dw,dh,depth_pred)
+        pred_cls_logits, pred_box_depth = det_depth_model(res3_reduced_feat, res4_reduced_feat)
         
-        # DSPNetSegmentationHead expects res3_reduced, res4_reduced, res5_reduced
         seg_out = seg_model(res3_reduced_feat, res4_reduced_feat, res5_reduced_feat)
-        
-        cls_loss = criterion['cls'](det_cls_pred.view(-1, det_cls_pred.size(-1)), targets_cls.view(-1)) 
-        reg_loss = criterion['reg'](det_box_depth_pred, targets_box_depth)
-        seg_loss = criterion['segmentation'](seg_out, targets_seg)
 
-        loss = cls_loss + reg_loss + wseg * seg_loss
+        # Separate box predictions and depth predictions
+        pred_loc = pred_box_depth[..., :4]
+        pred_depth = pred_box_depth[..., 4:] # Keep as (batch, num_anchors, 1)
+
+        # Detection Loss
+        # positive_mask might be needed if your ObjectDetectionLoss expects it explicitly
+        # For now, ObjectDetectionLoss handles positive_mask internally based on gt_det_cls > 0
+        det_total_loss, det_cls_loss, det_loc_loss = criterion['detection'](
+            pred_cls_logits, pred_loc, gt_det_cls, gt_det_loc
+        )
+
+        # Depth Loss
+        # SILogLoss expects (B, 1, H, W) or (B,H,W). Current pred_depth is (B, num_anchors, 1)
+        # This requires a re-think of how depth is predicted and targeted if using SILog directly
+        # For this example, assuming a placeholder "anchor-wise" depth loss or that targets/preds are reshaped/processed.
+        # Let's assume gt_depth and pred_depth are suitable for a simple L1 on anchor depths for now,
+        # or SILogLoss needs to be adapted / or depth is predicted per-pixel not per-anchor.
+        # For now, let's use a placeholder for depth loss calculation that matches shapes.
+        # This is a CRITICAL point: The current SILogLoss is designed for dense depth maps.
+        # If depth is predicted per anchor, SILogLoss might not be directly applicable without modification
+        # or a different loss like SmoothL1Loss applied to depth component.
+        # Using SmoothL1 for depth on anchors as a placeholder:
+        if 'depth' in criterion:
+             # gt_depth is (B, num_anchors, 1), pred_depth is (B, num_anchors, 1)
+             # We need to apply it only to positive anchors for depth, similar to loc loss
+             positive_mask_for_depth = (gt_det_cls > 0).unsqueeze(-1).expand_as(pred_depth)
+             if positive_mask_for_depth.sum() > 0:
+                 depth_loss_val = criterion['depth'](pred_depth[positive_mask_for_depth], gt_depth[positive_mask_for_depth])
+             else:
+                 depth_loss_val = torch.tensor(0.0, device=device)
+        else: # If SILogLoss was intended, this part needs a proper implementation strategy
+             depth_loss_val = torch.tensor(0.0, device=device) # Placeholder if no depth criterion
+
+        # Segmentation Loss
+        seg_loss_val = criterion['segmentation'](seg_out, gt_seg)
+
+        # Total Weighted Loss
+        loss = (loss_weights.get('detection', 1.0) * det_total_loss +
+                loss_weights.get('depth', 1.0) * depth_loss_val + # ADDED depth loss
+                loss_weights.get('segmentation', 1.0) * seg_loss_val)
+
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
         
-        progress_bar.set_postfix(loss=loss.item(), cls=cls_loss.item(), reg=reg_loss.item(), seg=seg_loss.item())
+        epoch_total_loss += loss.item()
+        epoch_det_cls_loss += det_cls_loss.item()
+        epoch_det_loc_loss += det_loc_loss.item()
+        epoch_depth_loss += depth_loss_val.item() # ADDED
+        epoch_seg_loss += seg_loss_val.item()
+        
+        progress_bar.set_postfix(
+            loss=loss.item(), 
+            det_cls=det_cls_loss.item(), 
+            det_loc=det_loc_loss.item(),
+            depth=depth_loss_val.item(), # ADDED
+            seg=seg_loss_val.item()
+        )
 
         if writer and batch_idx % config['logging']['log_interval'] == 0:
             current_iter = epoch * len(train_loader) + batch_idx
-            writer.add_scalar('train/cls_loss', cls_loss.item(), current_iter)
-            writer.add_scalar('train/reg_loss', reg_loss.item(), current_iter)
-            writer.add_scalar('train/seg_loss', seg_loss.item(), current_iter)
             writer.add_scalar('train/total_loss', loss.item(), current_iter)
-    return total_loss / len(train_loader) if len(train_loader) > 0 else 0
+            writer.add_scalar('train/detection_cls_loss', det_cls_loss.item(), current_iter)
+            writer.add_scalar('train/detection_loc_loss', det_loc_loss.item(), current_iter)
+            writer.add_scalar('train/depth_loss', depth_loss_val.item(), current_iter) # ADDED
+            writer.add_scalar('train/segmentation_loss', seg_loss_val.item(), current_iter)
+            
+    return (epoch_total_loss / len(train_loader) if len(train_loader) > 0 else 0,
+            epoch_det_cls_loss / len(train_loader) if len(train_loader) > 0 else 0,
+            epoch_det_loc_loss / len(train_loader) if len(train_loader) > 0 else 0,
+            epoch_depth_loss / len(train_loader) if len(train_loader) > 0 else 0, # ADDED
+            epoch_seg_loss / len(train_loader) if len(train_loader) > 0 else 0)
 
-def validate(backbone, det_depth_model, seg_model, val_loader, criterion, device, epoch, writer, wseg):
+
+# MODIFIED validate function signature and body
+def validate(backbone, det_depth_model, seg_model, val_loader, criterion, device, epoch, writer, config):
     backbone.eval()
     det_depth_model.eval()
     seg_model.eval()
-    total_loss = 0
+
+    epoch_total_loss = 0
+    epoch_det_cls_loss = 0
+    epoch_det_loc_loss = 0
+    epoch_depth_loss = 0
+    epoch_seg_loss = 0
+
+    loss_weights = config['loss']['weights']
+
     progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1} [VAL]")
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(progress_bar):
             images = images.to(device)
-            targets_cls = targets['cls'].to(device)
-            targets_box_depth = targets['box_and_depth'].to(device)
-            targets_seg = targets['segmentation'].to(device)
+            gt_det_cls = targets['detection_cls'].to(device).long()
+            gt_det_loc = targets['detection_loc'].to(device)
+            gt_depth = targets['depth'].to(device)
+            gt_seg = targets['segmentation'].to(device).long()
 
             res3_reduced_feat, res4_reduced_feat, res5_reduced_feat = backbone(images)
-            
-            # DSPNet_Detector now expects res3_reduced (128ch) and res4_reduced (256ch)
-            det_cls_pred, det_box_depth_pred = det_depth_model(res3_reduced_feat, res4_reduced_feat)
-            
-            # DSPNetSegmentationHead expects res3_reduced, res4_reduced, res5_reduced
+            pred_cls_logits, pred_box_depth = det_depth_model(res3_reduced_feat, res4_reduced_feat)
             seg_out = seg_model(res3_reduced_feat, res4_reduced_feat, res5_reduced_feat)
+
+            pred_loc = pred_box_depth[..., :4]
+            pred_depth = pred_box_depth[..., 4:]
+
+            det_total_loss, det_cls_loss, det_loc_loss = criterion['detection'](
+                pred_cls_logits, pred_loc, gt_det_cls, gt_det_loc
+            )
             
-            cls_loss = criterion['cls'](det_cls_pred.view(-1, det_cls_pred.size(-1)), targets_cls.view(-1))
-            reg_loss = criterion['reg'](det_box_depth_pred, targets_box_depth)
-            seg_loss = criterion['segmentation'](seg_out, targets_seg)
-            loss = cls_loss + reg_loss + wseg * seg_loss
-            total_loss += loss.item()
+            if 'depth' in criterion:
+                 positive_mask_for_depth = (gt_det_cls > 0).unsqueeze(-1).expand_as(pred_depth)
+                 if positive_mask_for_depth.sum() > 0:
+                     depth_loss_val = criterion['depth'](pred_depth[positive_mask_for_depth], gt_depth[positive_mask_for_depth])
+                 else:
+                     depth_loss_val = torch.tensor(0.0, device=device)
+            else:
+                 depth_loss_val = torch.tensor(0.0, device=device)
+
+            seg_loss_val = criterion['segmentation'](seg_out, gt_seg)
+
+            loss = (loss_weights.get('detection', 1.0) * det_total_loss +
+                    loss_weights.get('depth', 1.0) * depth_loss_val +
+                    loss_weights.get('segmentation', 1.0) * seg_loss_val)
+
+            epoch_total_loss += loss.item()
+            epoch_det_cls_loss += det_cls_loss.item()
+            epoch_det_loc_loss += det_loc_loss.item()
+            epoch_depth_loss += depth_loss_val.item()
+            epoch_seg_loss += seg_loss_val.item()
+            
             progress_bar.set_postfix(loss=loss.item())
 
-    avg_loss = total_loss / len(val_loader) if len(val_loader) > 0 else 0
+    avg_total_loss = epoch_total_loss / len(val_loader) if len(val_loader) > 0 else 0
+    avg_det_cls_loss = epoch_det_cls_loss / len(val_loader) if len(val_loader) > 0 else 0
+    avg_det_loc_loss = epoch_det_loc_loss / len(val_loader) if len(val_loader) > 0 else 0
+    avg_depth_loss = epoch_depth_loss / len(val_loader) if len(val_loader) > 0 else 0
+    avg_seg_loss = epoch_seg_loss / len(val_loader) if len(val_loader) > 0 else 0
+    
     if writer:
-        writer.add_scalar('val/total_loss', avg_loss, epoch)
-    return avg_loss
+        writer.add_scalar('val/total_loss', avg_total_loss, epoch)
+        writer.add_scalar('val/detection_cls_loss', avg_det_cls_loss, epoch)
+        writer.add_scalar('val/detection_loc_loss', avg_det_loc_loss, epoch)
+        writer.add_scalar('val/depth_loss', avg_depth_loss, epoch)
+        writer.add_scalar('val/segmentation_loss', avg_seg_loss, epoch)
+        
+    return avg_total_loss, avg_det_cls_loss, avg_det_loc_loss, avg_depth_loss, avg_seg_loss
+
 
 def main():
     args = parse_args()
@@ -167,18 +269,48 @@ def main():
 
     backbone = ResNetBackbone(pretrained=config['model']['pretrained']).to(device)
     
-    num_det_classes = config['model'].get('num_detection_classes', 20) 
+    # Detection model setup
+    num_det_classes_config = config['model'].get('num_detection_classes', 20) # Number of actual object classes
+    # For ObjectDetectionLoss, num_classes is often (num_object_classes + 1 background)
+    # However, FocalLoss inside ObjectDetectionLoss handles one-hot encoding based on pred_cls_logits.size(-1)
+    # So, DSPNet_Detector's num_classes should be (num_object_classes + 1)
+    # And ObjectDetectionLoss's num_classes should match that.
+    # Let's assume config['model']['num_detection_classes'] is the total including background if it's used directly by DSPNet_Detector
+    # or config['loss']['detection_num_classes'] is the one for the loss function.
+    # To be consistent, DSPNet_Detector should output logits for all classes including background.
+    
+    # Use num_detection_classes from model config for DSPNet_Detector, which should include background
+    # This value is also used by ObjectDetectionLoss internally for FocalLoss if not overridden
+    
+    # Let's ensure num_det_classes for DSPNet_Detector matches what ObjectDetectionLoss expects.
+    # ObjectDetectionLoss will use pred_cls_logits.size(-1) if its own num_classes isn't perfectly aligned
+    # with ground truth label encoding. The current ObjectDetectionLoss init takes num_classes.
+    
+    # Use the value from config['loss'] for ObjectDetectionLoss, which should be number of classes including background
+    # Use the value from config['model'] for DSPNet_Detector
+    
+    # If config['model']['num_detection_classes'] is for actual objects, then DSPNet_Detector needs +1 for background.
+    # Let's assume config['model']['num_detection_classes'] ALREADY INCLUDES background.
+    # And config['loss']['detection_num_classes'] also includes background.
+    
+    # The num_classes for ObjectDetectionLoss should match the output of the detector head.
+    # DSPNet_Detector is initialized with num_classes from config['model']['num_detection_classes']
+    
+    # Make sure this is the number of classes the detector head outputs (objects + background)
+    detector_output_num_classes = config['model'].get('num_detection_classes', 21) # Assuming this includes background
+
+
     anchors_per_loc = config['model'].get('anchors_per_location_list', [4, 6, 6, 6, 4, 4])
     if len(anchors_per_loc) != 6:
         raise ValueError("config.model.anchors_per_location_list must have 6 elements.")
 
     detection_model = DSPNet_Detector(
-        num_classes=num_det_classes, 
+        num_classes=detector_output_num_classes, 
         anchors_per_location_list=anchors_per_loc
     ).to(device)
     
     segmentation_model = DSPNetSegmentationHead(
-        num_classes=config['model']['num_classes']
+        num_classes=config['model']['num_classes'] # Number of segmentation classes
     ).to(device)
     
     train_loader, val_loader = create_dataloaders(config)
@@ -186,10 +318,39 @@ def main():
         print("Dataloaders are not initialized. Exiting. Please implement create_dataloaders.")
         return
 
+    # Initialize Loss Functions using config
+    loss_config = config.get('loss', {})
+    
+    # Segmentation Loss
+    seg_class_weights_list = loss_config.get('segmentation_class_weights', None)
+    seg_class_weights_tensor = torch.tensor(seg_class_weights_list, device=device) if seg_class_weights_list else None
+    
+    criterion_segmentation = SegmentationLoss(
+        weight=seg_class_weights_tensor,
+        ignore_index=loss_config.get('segmentation_ignore_index', -100)
+    )
+
+    # Object Detection Loss
+    # Ensure num_classes for ObjectDetectionLoss matches detector_output_num_classes
+    criterion_detection = ObjectDetectionLoss(
+        num_classes=detector_output_num_classes, 
+        focal_alpha=loss_config.get('focal_loss', {}).get('alpha', 0.25),
+        focal_gamma=loss_config.get('focal_loss', {}).get('gamma', 2.0),
+        smooth_l1_beta=loss_config.get('smooth_l1_beta', 1.0)
+        # cls_loss_weight and loc_loss_weight inside ObjectDetectionLoss are 1.0 by default,
+        # the overall detection task weight is applied later.
+    )
+
+    # Depth Loss (Using SmoothL1Loss as a placeholder for anchor-wise depth)
+    # SILogLoss from losses.py is for dense depth maps. If depth is predicted per anchor and SILog is desired,
+    # either the loss needs adaptation, or the network output/target format needs to change.
+    # For now, using SmoothL1Loss for the depth component of pred_box_depth
+    criterion_depth = nn.SmoothL1Loss(reduction='mean') # Or use SILog if adapted for anchors
+
     criterion = {
-        'cls': nn.CrossEntropyLoss(), 
-        'reg': nn.SmoothL1Loss(), 
-        'segmentation': nn.CrossEntropyLoss()
+        'detection': criterion_detection,
+        'segmentation': criterion_segmentation,
+        'depth': criterion_depth # Placeholder for depth per anchor
     }
     
     params = list(backbone.parameters()) + list(detection_model.parameters()) + list(segmentation_model.parameters())
@@ -211,7 +372,7 @@ def main():
     start_epoch = 0
     output_dir = "checkpoints"
     os.makedirs(output_dir, exist_ok=True)
-    best_val_loss = float('inf') # Initialize best_val_loss here
+    best_val_loss = float('inf')
 
     if args.resume and args.checkpoint:
         if os.path.isfile(args.checkpoint):
@@ -227,26 +388,25 @@ def main():
             print(f"Resumed. Starting from epoch {start_epoch}. Best val loss: {best_val_loss:.4f}")
         else:
             print(f"Checkpoint not found at {args.checkpoint}. Starting from scratch.")
-            # best_val_loss = float('inf') # Already initialized
-    # else:
-        # best_val_loss = float('inf') # Already initialized
-    
-    wseg = config['training'].get('segmentation_loss_weight', 4.0) 
+
+    # Overall loss weights are now fetched from config['loss']['weights']['segmentation']
+    # The old wseg is effectively replaced by config['loss']['weights']['segmentation']
 
     for epoch in range(start_epoch, config['training']['epochs']):
-        print(f'Epoch {epoch+1}/{config['training']['epochs']}')
+        train_results = train(backbone, detection_model, segmentation_model, train_loader, optimizer, criterion, device, epoch, writer, config)
+        train_total_loss, train_det_cls, train_det_loc, train_depth, train_seg = train_results
+        print(f"Epoch {epoch+1}/{config['training']['epochs']}")
+        print(f"Train Total Loss: {train_total_loss:.4f}, DetCls: {train_det_cls:.4f}, DetLoc: {train_det_loc:.4f}, Depth: {train_depth:.4f}, Seg: {train_seg:.4f}")
         
-        train_loss = train(backbone, detection_model, segmentation_model, train_loader, optimizer, criterion, device, epoch, writer, config, wseg)
-        print(f'Train Loss: {train_loss:.4f}')
-        
-        val_loss = validate(backbone, detection_model, segmentation_model, val_loader, criterion, device, epoch, writer, wseg)
-        print(f'Validation Loss: {val_loss:.4f}')
+        val_results = validate(backbone, detection_model, segmentation_model, val_loader, criterion, device, epoch, writer, config)
+        val_total_loss, val_det_cls, val_det_loc, val_depth, val_seg = val_results
+        print(f"Validation Total Loss: {val_total_loss:.4f}, DetCls: {val_det_cls:.4f}, DetLoc: {val_det_loc:.4f}, Depth: {val_depth:.4f}, Seg: {val_seg:.4f}")
         
         scheduler.step()
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_path = os.path.join(output_dir, f'best_model_epoch_{epoch+1}.pth')
+        if val_total_loss < best_val_loss:
+            best_val_loss = val_total_loss
+            save_path = os.path.join(output_dir, f"best_model_epoch_{epoch+1}.pth")
             torch.save({
                 'epoch': epoch,
                 'backbone_state_dict': backbone.state_dict(),
@@ -254,28 +414,14 @@ def main():
                 'segmentation_model_state_dict': segmentation_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'val_loss': val_loss,
+                'val_loss': best_val_loss,
                 'config': config
             }, save_path)
-            print(f"Saved best model to {save_path}")
-        
-        if (epoch + 1) % config['logging']['save_interval'] == 0:
-            save_path_interval = os.path.join(output_dir, f'model_epoch_{epoch+1}.pth')
-            torch.save({
-                'epoch': epoch,
-                'backbone_state_dict': backbone.state_dict(),
-                'detection_model_state_dict': detection_model.state_dict(),
-                'segmentation_model_state_dict': segmentation_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'val_loss': val_loss, 
-                 'config': config
-            }, save_path_interval)
-            print(f"Saved model checkpoint to {save_path_interval}")
+            print(f"Model saved to {save_path}")
 
     if writer:
         writer.close()
-    print("Training completed.")
+    print("Training finished.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main() 
