@@ -10,6 +10,7 @@ from tqdm import tqdm
 import os
 from datetime import datetime
 from torch.optim.lr_scheduler import MultiStepLR
+import math # Added for calculations
 
 # Import model components from their respective files
 from projects.safestrp.resnet_backbone import ResNetBackbone
@@ -17,6 +18,7 @@ from projects.safestrp.ssd_depth import DSPNet_Detector
 from projects.safestrp.dspnet_seg import DSPNetSegmentationHead
 # Import custom loss functions
 from projects.safestrp.losses import SegmentationLoss, ObjectDetectionLoss, SILogLoss # MODIFIED
+from projects.safestrp.utils.anchors import AnchorGenerator, AnchorMatcher # Added
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Multi-task Learning Training')
@@ -30,55 +32,132 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return config
 
-def create_dataloaders(config):
-    # TODO: Implement your dataset loading logic here
-    # This is a placeholder - you'll need to implement your own dataset classes
+def get_anchor_config(config, image_h, image_w):
+    """Prepares configuration for AnchorGenerator based on main config."""
+    num_feature_levels = 7 # Consistent with DSPNet_Detector
+
+    # 1. Feature map sizes (derive from image size and backbone structure)
+    # (H, W) format for feature maps
+    feature_map_sizes = []
+    current_h, current_w = image_h, image_w
+    strides = [8, 2, 2, 2, 2, 2, 2] # Effective strides for C3,C4,C5, EL1,EL2,EL3,EL4
+    # C3: /8. C4: /16. C5: /32. EL1: /64 ... EL4: /256 is wrong.
+    # Strides for feature maps for detector:
+    # C3 from ResNet Layer2: H/8, W/8
+    # C4 from ResNet Layer3: H/16, W/16
+    # C5 from ResNet Layer4: H/32, W/32
+    # ExtraLayer1 (input C5, stride 2): H/64, W/64
+    # ExtraLayer2 (input EL1, stride 2): H/128, W/128
+    # ExtraLayer3 (input EL2, stride 2): H/256, W/256
+    # ExtraLayer4 (input EL3, stride 2): H/512, W/512
+    base_strides = [8, 16, 32, 64, 128, 256, 512]
+    for stride_val in base_strides:
+        feature_map_sizes.append((math.ceil(image_h / stride_val), math.ceil(image_w / stride_val)))
+    
+    # 2. Min/Max sizes for anchors (example: SSD-style scale progression)
+    # These should ideally come from config or be carefully designed.
+    # Using placeholder values or simplified SSD-like calculation for now.
+    # dspnet has explicit min_sizes like [30,60,120,180,240,300] for 6 levels
+    # For 7 levels, we need 7 min_sizes. Max_sizes are optional for AnchorGenerator
+    # (used for sqrt(min*max) anchor).
+    default_min_sizes = config['model'].get('anchor_min_sizes', [20.0, 40.0, 80.0, 120.0, 160.0, 220.0, 280.0])
+    default_max_sizes = config['model'].get('anchor_max_sizes', [40.0, 80.0, 120.0, 160.0, 220.0, 280.0, 320.0]) 
+    # Ensure lists have 7 elements if provided, otherwise use defaults that have 7.
+    if len(default_min_sizes) != num_feature_levels:
+        print(f"Warning: anchor_min_sizes in config should have {num_feature_levels} elements. Using default.")
+        default_min_sizes = [20.0, 40.0, 80.0, 120.0, 160.0, 220.0, 280.0]
+    if default_max_sizes and len(default_max_sizes) != num_feature_levels:
+        print(f"Warning: anchor_max_sizes in config should have {num_feature_levels} elements if provided. Using default or disabling.")
+        default_max_sizes = [40.0, 80.0, 120.0, 160.0, 220.0, 280.0, 320.0]
+
+    # 3. Aspect Ratios (derived from anchors_per_location_list)
+    # anchors_per_location_list: e.g. [4,4,6,6,6,4,4] for 7 feature maps
+    # Number of anchors = 1 (min@AR1) + (1 if max_size else 0) (max@AR1) + len(aspect_ratios_list_for_level)
+    anchor_counts = config['model'].get('anchors_per_location_list', [4, 4, 6, 6, 6, 4, 4])
+    if len(anchor_counts) != num_feature_levels:
+        print(f"Warning: anchors_per_location_list must have {num_feature_levels} elements. Using default.")
+        anchor_counts = [4, 4, 6, 6, 6, 4, 4]
+
+    # Define what ARs to add for a given target count of anchors per location
+    # Assumes max_sizes are provided, so 2 base anchors (min@1, sqrt(min*max)@1) are always generated.
+    # The list here specifies additional ARs to apply to min_size.
+    aspect_ratios_map = {
+        2: [],  # Results in 2 anchors if max_sizes are used
+        3: [[2.0]], # Results in 2 + 1 = 3 anchors (e.g. AR 2.0 for min_size)
+        4: [[2.0, 0.5]], # Results in 2 + 2 = 4 anchors
+        5: [[2.0, 0.5, 3.0]],
+        6: [[2.0, 0.5, 3.0, 1.0/3.0]]
+    }
+    aspect_ratios_for_generator = []
+    for count in anchor_counts:
+        num_additional_ars_needed = count - (2 if default_max_sizes else 1)
+        found_map = False
+        for key_count, ar_list in aspect_ratios_map.items():
+             if len(ar_list) == num_additional_ars_needed and (key_count == count if default_max_sizes else key_count == count -1 ):
+                  aspect_ratios_for_generator.append(ar_list)
+                  found_map = True
+                  break
+        if not found_map:
+            print(f"Warning: Could not map anchor count {count} to a predefined aspect ratio set. Using empty AR list for this level, resulting in {2 if default_max_sizes else 1} anchors.")
+            aspect_ratios_for_generator.append([])
+
+    return {
+        'image_size': (image_h, image_w),
+        'feature_map_sizes': feature_map_sizes,
+        'min_sizes': default_min_sizes,
+        'max_sizes': default_max_sizes, # Can be None if not configured
+        'aspect_ratios': aspect_ratios_for_generator,
+        'clip': config['model'].get('anchors_clip', True),
+        'anchors_per_location_list': anchor_counts # For reference
+    }
+
+def create_dataloaders(config, anchor_config_for_priors, anchor_matcher):
     print("Placeholder create_dataloaders called. Implement actual dataset loading.")
-    if config['training']['batch_size'] > 0 : 
-        dummy_images = torch.randn(config['training']['batch_size'], 3, config['data']['image_size'][1], config['data']['image_size'][0])
-        
-        h, w = config['data']['image_size'][1], config['data']['image_size'][0]
-        # Assuming anchors_per_location_list is available and correctly defined
-        num_anchors_placeholder = config['model'].get('anchors_per_location_list', [4,6,6,6,4,4])
-        
-        s0_h, s0_w = h // 8, w // 8
-        s1_h, s1_w = h // 16, w // 16
-        s2_h, s2_w = s1_h // 2, s1_w // 2
-        s3_h, s3_w = s2_h // 2, s2_w // 2
-        s4_h, s4_w = s3_h // 2, s3_w // 2
-        s5_h, s5_w = s4_h // 2, s4_w // 2
+    batch_size = config['training']['batch_size']
+    if batch_size <= 0:
+        return [], []
 
-        total_anchors = (s0_h * s0_w * num_anchors_placeholder[0]) + \
-                        (s1_h * s1_w * num_anchors_placeholder[1]) + \
-                        (s2_h * s2_w * num_anchors_placeholder[2]) + \
-                        (s3_h * s3_w * num_anchors_placeholder[3]) + \
-                        (s4_h * s4_w * num_anchors_placeholder[4]) + \
-                        (s5_h * s5_w * num_anchors_placeholder[5])
+    image_h, image_w = anchor_config_for_priors['image_size']
+    dummy_images = torch.randn(batch_size, 3, image_h, image_w)
+    
+    # Use AnchorGenerator to calculate total_anchors for dummy target shapes
+    # This is a bit circular for dummy data, but demonstrates use of AnchorGenerator properties
+    # For real data, priors are generated once and used by matcher in dataset __getitem__
+    temp_anchor_gen = AnchorGenerator(**anchor_config_for_priors) # Use full config
+    total_anchors = temp_anchor_gen.get_priors().shape[0]
+    print(f"Total anchors calculated by AnchorGenerator for dummy data shape: {total_anchors}")
 
-        # For dummy_reg_target, last dimension 5 means (dx, dy, dw, dh, depth_target)
-        # For gt_cls_labels, values are class indices. 0 for background.
-        # num_detection_classes includes background. If config has num_object_classes, add 1.
-        num_det_classes_for_dummy = config['loss'].get('detection_num_classes', config['model'].get('num_detection_classes', 20) + 1)
+    # Check against manual calculation (from previous version for verification)
+    # This manual calculation should match AnchorGenerator if config is consistent.
+    num_anchors_per_loc_config = anchor_config_for_priors['anchors_per_location_list']
+    manual_total_anchors = 0
+    for i, fm_size in enumerate(anchor_config_for_priors['feature_map_sizes']):
+        manual_total_anchors += fm_size[0] * fm_size[1] * num_anchors_per_loc_config[i]
+    
+    if total_anchors != manual_total_anchors:
+        print(f"Warning: AnchorGenerator total anchors ({total_anchors}) mismatch manual calc ({manual_total_anchors}). Check anchor config consistency.")
+        # Fallback to manual for dummy data if mismatch, though ideally this shouldn't happen.
+        total_anchors = manual_total_anchors 
 
-        dummy_cls_target = torch.randint(0, num_det_classes_for_dummy, (config['training']['batch_size'], total_anchors)) 
-        dummy_box_target = torch.rand(config['training']['batch_size'], total_anchors, 4) # dx, dy, dw, dh
-        dummy_depth_target = torch.rand(config['training']['batch_size'], total_anchors, 1) * 10 # depth
-        
-        dummy_seg_target = torch.randint(0, config['model']['num_classes'], (config['training']['batch_size'], config['data']['image_size'][1] // 2, config['data']['image_size'][0] // 2))
-        
-        dummy_targets = {
-            'detection_cls': dummy_cls_target,
-            'detection_loc': dummy_box_target,
-            'depth': dummy_depth_target, # Associated with anchors for this dummy data
-            'segmentation': dummy_seg_target
-        }
-        num_dummy_batches_train = 5 
-        num_dummy_batches_val = 2
-        train_loader = [(dummy_images, dummy_targets)] * num_dummy_batches_train
-        val_loader = [(dummy_images, dummy_targets)] * num_dummy_batches_val
-    else:
-        train_loader = []
-        val_loader = []
+    num_det_classes_for_dummy = config['model'].get('num_detection_classes', 21) # Includes background
+
+    dummy_cls_target = torch.randint(0, num_det_classes_for_dummy, (batch_size, total_anchors))
+    dummy_box_target = torch.rand(batch_size, total_anchors, 4)
+    dummy_depth_target = torch.rand(batch_size, total_anchors, 1) * 10
+    
+    seg_h_out, seg_w_out = image_h // 2, image_w // 2 # Example output size for segmentation
+    dummy_seg_target = torch.randint(0, config['model']['num_classes'], (batch_size, seg_h_out, seg_w_out))
+    
+    dummy_targets = {
+        'detection_cls': dummy_cls_target,
+        'detection_loc': dummy_box_target,
+        'depth': dummy_depth_target,
+        'segmentation': dummy_seg_target
+    }
+    num_dummy_batches_train = 5
+    num_dummy_batches_val = 2
+    train_loader = [(dummy_images, dummy_targets)] * num_dummy_batches_train
+    val_loader = [(dummy_images, dummy_targets)] * num_dummy_batches_val
 
     return train_loader, val_loader
 
@@ -104,13 +183,13 @@ def train(backbone, det_depth_model, seg_model, train_loader, optimizer, criteri
         gt_depth = targets['depth'].to(device) # (batch, num_anchors, 1)
         gt_seg = targets['segmentation'].to(device).long() # Ensure long type
 
-        res3_reduced_feat, res4_reduced_feat, res5_reduced_feat = backbone(images)
+        c3_feat, c4_feat, c5_feat = backbone(images)
         
         # pred_cls_logits: (batch, num_anchors, num_classes)
         # pred_box_depth: (batch, num_anchors, 5) where last dim is (dx,dy,dw,dh,depth_pred)
-        pred_cls_logits, pred_box_depth = det_depth_model(res3_reduced_feat, res4_reduced_feat)
+        pred_cls_logits, pred_box_depth = det_depth_model(c3_feat, c4_feat, c5_feat)
         
-        seg_out = seg_model(res3_reduced_feat, res4_reduced_feat, res5_reduced_feat)
+        seg_out = seg_model(c3_feat, c4_feat, c5_feat)
 
         # Separate box predictions and depth predictions
         pred_loc = pred_box_depth[..., :4]
@@ -118,6 +197,7 @@ def train(backbone, det_depth_model, seg_model, train_loader, optimizer, criteri
 
         # Detection Loss
         # positive_mask might be needed if your ObjectDetectionLoss expects it explicitly
+        # For now, ObjectDetectionLoss handles positive_mask internally based on gt_det_cls > 0
         # For now, ObjectDetectionLoss handles positive_mask internally based on gt_det_cls > 0
         det_total_loss, det_cls_loss, det_loc_loss = criterion['detection'](
             pred_cls_logits, pred_loc, gt_det_cls, gt_det_loc
@@ -210,9 +290,9 @@ def validate(backbone, det_depth_model, seg_model, val_loader, criterion, device
             gt_depth = targets['depth'].to(device)
             gt_seg = targets['segmentation'].to(device).long()
 
-            res3_reduced_feat, res4_reduced_feat, res5_reduced_feat = backbone(images)
-            pred_cls_logits, pred_box_depth = det_depth_model(res3_reduced_feat, res4_reduced_feat)
-            seg_out = seg_model(res3_reduced_feat, res4_reduced_feat, res5_reduced_feat)
+            c3_feat, c4_feat, c5_feat = backbone(images)
+            pred_cls_logits, pred_box_depth = det_depth_model(c3_feat, c4_feat, c5_feat)
+            seg_out = seg_model(c3_feat, c4_feat, c5_feat)
 
             pred_loc = pred_box_depth[..., :4]
             pred_depth = pred_box_depth[..., 4:]
@@ -267,53 +347,43 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # Image dimensions from config (H, W for consistency with model internals)
+    image_h = config['data']['image_size'][1]
+    image_w = config['data']['image_size'][0]
+
+    # --- Anchor Setup ---
+    anchor_params = get_anchor_config(config, image_h, image_w)
+    anchor_generator = AnchorGenerator(**anchor_params) # Pass all derived params
+    priors_xyxy = anchor_generator.get_priors().to(device)
+    
+    anchor_matcher = AnchorMatcher(
+        priors_xyxy=priors_xyxy,
+        iou_threshold_positive=config['loss'].get('anchor_iou_positive_threshold', 0.5),
+        iou_threshold_negative=config['loss'].get('anchor_iou_negative_threshold', 0.4),
+        allow_low_quality_matches=config['loss'].get('anchor_allow_low_quality', True),
+        variances=config['model'].get('anchor_variances', [0.1, 0.1, 0.2, 0.2])
+    )
+    print(f"Generated {priors_xyxy.shape[0]} priors/anchors.")
+    # --- End Anchor Setup ---
+
     backbone = ResNetBackbone(pretrained=config['model']['pretrained']).to(device)
     
-    # Detection model setup
-    num_det_classes_config = config['model'].get('num_detection_classes', 20) # Number of actual object classes
-    # For ObjectDetectionLoss, num_classes is often (num_object_classes + 1 background)
-    # However, FocalLoss inside ObjectDetectionLoss handles one-hot encoding based on pred_cls_logits.size(-1)
-    # So, DSPNet_Detector's num_classes should be (num_object_classes + 1)
-    # And ObjectDetectionLoss's num_classes should match that.
-    # Let's assume config['model']['num_detection_classes'] is the total including background if it's used directly by DSPNet_Detector
-    # or config['loss']['detection_num_classes'] is the one for the loss function.
-    # To be consistent, DSPNet_Detector should output logits for all classes including background.
-    
-    # Use num_detection_classes from model config for DSPNet_Detector, which should include background
-    # This value is also used by ObjectDetectionLoss internally for FocalLoss if not overridden
-    
-    # Let's ensure num_det_classes for DSPNet_Detector matches what ObjectDetectionLoss expects.
-    # ObjectDetectionLoss will use pred_cls_logits.size(-1) if its own num_classes isn't perfectly aligned
-    # with ground truth label encoding. The current ObjectDetectionLoss init takes num_classes.
-    
-    # Use the value from config['loss'] for ObjectDetectionLoss, which should be number of classes including background
-    # Use the value from config['model'] for DSPNet_Detector
-    
-    # If config['model']['num_detection_classes'] is for actual objects, then DSPNet_Detector needs +1 for background.
-    # Let's assume config['model']['num_detection_classes'] ALREADY INCLUDES background.
-    # And config['loss']['detection_num_classes'] also includes background.
-    
-    # The num_classes for ObjectDetectionLoss should match the output of the detector head.
-    # DSPNet_Detector is initialized with num_classes from config['model']['num_detection_classes']
-    
-    # Make sure this is the number of classes the detector head outputs (objects + background)
-    detector_output_num_classes = config['model'].get('num_detection_classes', 21) # Assuming this includes background
-
-
-    anchors_per_loc = config['model'].get('anchors_per_location_list', [4, 6, 6, 6, 4, 4])
-    if len(anchors_per_loc) != 6:
-        raise ValueError("config.model.anchors_per_location_list must have 6 elements.")
+    detector_output_num_classes = config['model'].get('num_detection_classes', 21) # Includes background
+    # anchors_per_location_list is now sourced from anchor_params for consistency
+    anchors_per_loc_list_for_detector = anchor_params['anchors_per_location_list'] 
 
     detection_model = DSPNet_Detector(
         num_classes=detector_output_num_classes, 
-        anchors_per_location_list=anchors_per_loc
+        anchors_per_location_list=anchors_per_loc_list_for_detector
     ).to(device)
     
     segmentation_model = DSPNetSegmentationHead(
         num_classes=config['model']['num_classes'] # Number of segmentation classes
     ).to(device)
     
-    train_loader, val_loader = create_dataloaders(config)
+    # Pass anchor_params and anchor_matcher to dataloaders for real data handling
+    # For dummy data, create_dataloaders uses anchor_params to shape targets.
+    train_loader, val_loader = create_dataloaders(config, anchor_params, anchor_matcher)
     if not train_loader or not val_loader:
         print("Dataloaders are not initialized. Exiting. Please implement create_dataloaders.")
         return

@@ -23,7 +23,7 @@ class PredictionHead(nn.Module):
         self.num_classes = num_classes
         self.num_anchors_per_location = num_anchors_per_location
         self.classifier_head = nn.Conv2d(in_channels,
-                                         num_anchors_per_location * (num_classes + 1),
+                                         num_anchors_per_location * (num_classes + 1), # +1 for background
                                          kernel_size=3, padding=1)
         self.regressor_head = nn.Conv2d(in_channels,
                                         num_anchors_per_location * (4 + 1), # 4 for bbox, 1 for depth
@@ -38,64 +38,76 @@ class PredictionHead(nn.Module):
         reg_preds = reg_preds.view(reg_preds.size(0), -1, 5)
         return cls_preds, reg_preds
 
-# 4. DSPNet_Detector (Modified to use channel-reduced backbone outputs and align with diagram)
+# 4. DSPNet_Detector (Modified to align with dspnet's ResNet-50 feature sources)
 class DSPNet_Detector(nn.Module):
-    def __init__(self, num_classes, anchors_per_location_list): 
+    def __init__(self, num_classes, anchors_per_location_list, min_filter_extra_layers=128):
         super().__init__()
-        if len(anchors_per_location_list) != 6:
-            # Expecting 6 prediction sources: res4_reduced, res5_reduced, and 4 extra layers
-            raise ValueError("anchors_per_location_list must have 6 elements for 6 feature sources.")
+        if len(anchors_per_location_list) != 7: # 3 backbone features + 4 extra layers
+            raise ValueError("anchors_per_location_list must have 7 elements for 7 feature sources.")
 
-        # Input channels from ResNetBackbone (reduced features)
-        self.input_res3_reduced_channels = 128 # C3_reduced from backbone
-        self.input_res4_reduced_channels = 256 # C4_reduced from backbone
+        # Input channels from ResNet50 Backbone (original channels, no reduction here)
+        # These are typical output channels for ResNet-50 stages
+        self.input_res3_channels = 512   # C3 output (e.g., resnet_backbone.layer2 output)
+        self.input_res4_channels = 1024  # C4 output (e.g., resnet_backbone.layer3 output)
+        self.input_res5_channels = 2048  # C5 output (e.g., resnet_backbone.layer4 output)
 
-        # Extra Layers: Start from res4_reduced_feat, 4 layers in total
-        # Output channels and structure inspired by DSPNet diagram's featX_2 layers, but starting from res4_reduced
-
-        # el1: Input from res4_reduced (256ch). Target output similar to feat1_2 (512ch)
-        el1_out_channels = 512 
-        self.extra_layer1 = conv_unit(self.input_res4_reduced_channels, mid_channels=256, out_channels=el1_out_channels, stride_3x3=2)
+        # Extra Layers: Start from res5_feat (C5), 4 layers in total
+        # Output channels for extra layers based on dspnet's num_filters = [..., 512, 256, 256, 128]
         
-        # el2: Input from extra_layer1 (512ch). Target output similar to feat2_2 (256ch)
+        # el1: Input from res5_feat (2048ch). Target output 512ch. Stride 2.
+        el1_out_channels = 512
+        el1_mid_channels = max(min_filter_extra_layers, el1_out_channels // 2)
+        self.extra_layer1 = conv_unit(self.input_res5_channels, mid_channels=el1_mid_channels, out_channels=el1_out_channels, stride_3x3=2)
+
+        # el2: Input from extra_layer1 (512ch). Target output 256ch. Stride 2.
         el2_out_channels = 256
-        self.extra_layer2 = conv_unit(el1_out_channels, mid_channels=128, out_channels=el2_out_channels, stride_3x3=2)
-        
-        # el3: Input from extra_layer2 (256ch). Target output similar to feat3_2 (128ch)
-        el3_out_channels = 128
-        self.extra_layer3 = conv_unit(el2_out_channels, mid_channels=64, out_channels=el3_out_channels, stride_3x3=2)
-        
-        # el4: Input from extra_layer3 (128ch). Target output similar to feat4_2 (64ch)
-        el4_out_channels = 64
-        self.extra_layer4 = conv_unit(el3_out_channels, mid_channels=32, out_channels=el4_out_channels, stride_3x3=2) 
+        el2_mid_channels = max(min_filter_extra_layers, el2_out_channels // 2)
+        self.extra_layer2 = conv_unit(el1_out_channels, mid_channels=el2_mid_channels, out_channels=el2_out_channels, stride_3x3=2)
 
+        # el3: Input from extra_layer2 (256ch). Target output 256ch. Stride 2.
+        el3_out_channels = 256
+        el3_mid_channels = max(min_filter_extra_layers, el3_out_channels // 2)
+        self.extra_layer3 = conv_unit(el2_out_channels, mid_channels=el3_mid_channels, out_channels=el3_out_channels, stride_3x3=2)
+
+        # el4: Input from extra_layer3 (256ch). Target output 128ch. Stride 2.
+        el4_out_channels = 128
+        # Corrected mid_channels based on dspnet common.py: max(min_filter, out_channels // 2)
+        el4_mid_channels = max(min_filter_extra_layers, el4_out_channels // 2) # max(128, 128//2) = max(128, 64) = 128
+        self.extra_layer4 = conv_unit(el3_out_channels, mid_channels=el4_mid_channels,  out_channels=el4_out_channels, stride_3x3=2)
+
+        # Prediction heads for each feature source
+        # The input channels to PredictionHead must match the output channels of the feature source
         self.pred_heads = nn.ModuleList([
-            PredictionHead(self.input_res3_reduced_channels, anchors_per_location_list[0], num_classes), # Source 0: res3_reduced
-            PredictionHead(self.input_res4_reduced_channels, anchors_per_location_list[1], num_classes), # Source 1: res4_reduced
-            PredictionHead(el1_out_channels, anchors_per_location_list[2], num_classes),                 # Source 2: extra_layer1 output
-            PredictionHead(el2_out_channels, anchors_per_location_list[3], num_classes),                 # Source 3: extra_layer2 output
-            PredictionHead(el3_out_channels, anchors_per_location_list[4], num_classes),                 # Source 4: extra_layer3 output
-            PredictionHead(el4_out_channels, anchors_per_location_list[5], num_classes)                  # Source 5: extra_layer4 output
+            PredictionHead(self.input_res3_channels, anchors_per_location_list[0], num_classes), # Source 0: C3
+            PredictionHead(self.input_res4_channels, anchors_per_location_list[1], num_classes), # Source 1: C4
+            PredictionHead(self.input_res5_channels, anchors_per_location_list[2], num_classes), # Source 2: C5
+            PredictionHead(el1_out_channels, anchors_per_location_list[3], num_classes),         # Source 3: extra_layer1 output
+            PredictionHead(el2_out_channels, anchors_per_location_list[4], num_classes),         # Source 4: extra_layer2 output
+            PredictionHead(el3_out_channels, anchors_per_location_list[5], num_classes),         # Source 5: extra_layer3 output
+            PredictionHead(el4_out_channels, anchors_per_location_list[6], num_classes)          # Source 6: extra_layer4 output
         ])
 
-    # Accepts res3_reduced_feat and res4_reduced_feat from an external backbone
-    def forward(self, res3_reduced_feat, res4_reduced_feat):
-        # res3_reduced_feat: (Batch, 128, H/8, W/8)
-        # res4_reduced_feat: (Batch, 256, H/16, W/16)
+    # Accepts res3_feat, res4_feat, res5_feat from an external ResNet-50 backbone
+    def forward(self, res3_feat, res4_feat, res5_feat):
+        # Expected shapes assuming input H, W (e.g., 512, 1024 for dspnet)
+        # res3_feat: (Batch, 512, H/8, W/8)
+        # res4_feat: (Batch, 1024, H/16, W/16)
+        # res5_feat: (Batch, 2048, H/32, W/32)
 
-        # Extra layer features are derived from res4_reduced_feat
-        feat_source_el1 = self.extra_layer1(res4_reduced_feat) 
-        feat_source_el2 = self.extra_layer2(feat_source_el1)   
-        feat_source_el3 = self.extra_layer3(feat_source_el2)   
-        feat_source_el4 = self.extra_layer4(feat_source_el3)
+        # Extra layer features are derived from res5_feat
+        feat_source_el1 = self.extra_layer1(res5_feat)      # Output: (Batch, 512, H/64, W/64)
+        feat_source_el2 = self.extra_layer2(feat_source_el1)  # Output: (Batch, 256, H/128, W/128)
+        feat_source_el3 = self.extra_layer3(feat_source_el2)  # Output: (Batch, 256, H/256, W/256)
+        feat_source_el4 = self.extra_layer4(feat_source_el3)  # Output: (Batch, 128, H/512, W/512)
 
         feature_sources_for_heads = [
-            res3_reduced_feat, # Source 0
-            res4_reduced_feat, # Source 1
-            feat_source_el1,   # Source 2
-            feat_source_el2,   # Source 3
-            feat_source_el3,   # Source 4
-            feat_source_el4    # Source 5
+            res3_feat,         # Source 0
+            res4_feat,         # Source 1
+            res5_feat,         # Source 2
+            feat_source_el1,   # Source 3
+            feat_source_el2,   # Source 4
+            feat_source_el3,   # Source 5
+            feat_source_el4    # Source 6
         ]
 
         all_cls_preds = []
@@ -106,58 +118,10 @@ class DSPNet_Detector(nn.Module):
             all_cls_preds.append(cls_preds)
             all_reg_preds.append(reg_preds)
 
+        # Concatenate predictions from all feature sources
+        # Output shape: (Batch, TotalNumberOfAnchors, NumClasses + 1)
         final_cls_preds = torch.cat(all_cls_preds, dim=1)
+        # Output shape: (Batch, TotalNumberOfAnchors, 5) (4 for bbox, 1 for depth)
         final_reg_preds = torch.cat(all_reg_preds, dim=1)
 
         return final_cls_preds, final_reg_preds
-
-# Example usage (for testing the structure - needs to be adapted if run standalone)
-# if __name__ == '__main__':
-#     # Assuming resnet_backbone.py returns res3_reduced, res4_reduced, res5_reduced
-#     # from projects.safestrp.resnet_backbone import ResNetBackbone 
-#     # backbone_test = ResNetBackbone(pretrained=False)
-#     # dummy_image_input = torch.randn(1, 3, 512, 1024) 
-#     
-#     # res3_r_test, res4_r_test, _ = backbone_test(dummy_image_input) # We need res3_reduced and res4_reduced
-#     # print(f"res3_reduced shape: {res3_r_test.shape}") # Expected: B, 128, H/8, W/8
-#     # print(f"res4_reduced shape: {res4_r_test.shape}") # Expected: B, 256, H/16, W/16
-#
-#     num_classes_example = 20 
-#     anchors_per_loc_list_example = [4, 6, 6, 6, 4, 4] 
-#     
-#     dspnet_detector_head = DSPNet_Detector(
-#         num_classes=num_classes_example,
-#         anchors_per_location_list=anchors_per_loc_list_example
-#     )
-#     dspnet_detector_head.eval()
-# 
-#     # Create dummy reduced C3 and C4 feature maps (as if from backbone)
-#     # Input H=512, W=1024
-#     # res3_reduced (H/8, W/8): 512/8=64, 1024/8=128. Shape: (1, 128, 64, 128)
-#     # res4_reduced (H/16, W/16): 512/16=32, 1024/16=64. Shape: (1, 256, 32, 64)
-#     dummy_res3_reduced_feat = torch.randn(1, 128, 64, 128)
-#     dummy_res4_reduced_feat = torch.randn(1, 256, 32, 64)
-# 
-#     with torch.no_grad():
-#         cls_predictions, reg_predictions = dspnet_detector_head(dummy_res3_reduced_feat, dummy_res4_reduced_feat)
-# 
-#     print("DSPNet_Detector (Head Only with res3_reduced, res4_reduced inputs) Test:")
-#     print("Classification Predictions Shape:", cls_predictions.shape)
-#     print("Regression (bbox + depth) Predictions Shape:", reg_predictions.shape)
-# 
-#     # Calculate expected total anchors for H=512, W=1024 input
-#     # Source 0 (res3_reduced, 64x128): (64*128) * anchors_per_loc_list_example[0]
-#     # Source 1 (res4_reduced, 32x64): (32*64) * anchors_per_loc_list_example[1]
-#     # Source 2 (el1 from res4_reduced, stride=2, 16x32): (16*32) * anchors_per_loc_list_example[2]
-#     # Source 3 (el2 from el1, stride=2, 8x16): (8*16) * anchors_per_loc_list_example[3]
-#     # Source 4 (el3 from el2, stride=2, 4x8): (4*8) * anchors_per_loc_list_example[4]
-#     # Source 5 (el4 from el3, stride=2, 2x4): (2*4) * anchors_per_loc_list_example[5]
-#     
-#     # L0 (res3_r): 8192 * 4 = 32768
-#     # L1 (res4_r): 2048 * 6 = 12288
-#     # L2 (el1):    512 * 6 = 3072
-#     # L3 (el2):    128 * 6 = 768
-#     # L4 (el3):     32 * 4 = 128
-#     # L5 (el4):      8 * 4 = 32
-#     # Total (example for [4,6,6,6,4,4]): 32768 + 12288 + 3072 + 768 + 128 + 32 = 49056
-#     # print(f"Expected total anchors for H=512, W=1024: {49056}")

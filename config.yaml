@@ -5,34 +5,37 @@ model:
   detection_heads: 1
   depth_estimation: true
   num_detection_classes: 21 # Example: 20 object classes + 1 background
-  anchors_per_location_list: [4, 6, 6, 6, 4, 4] # Example, ensure consistent with model
+  anchors_per_location_list: [4, 6, 6, 6, 6, 4, 4] # For 7 feature maps, based on MXNet analysis
 
   anchors:
     # feature_map_sizes will be derived from image_size and feature_strides
     # image_size will be taken from data.image_size: [1024, 512] (W, H), so AnchorGenerator expects (H, W) -> (512, 1024)
-    feature_strides: [8, 16, 32, 64, 128, 256] # Strides for ['res3_reduced', 'res4_reduced', 'extra1', 'extra2', 'extra3', 'extra4']
+    feature_strides: [8, 16, 32, 64, 128, 256, 512] # Strides for C3, C4, C5, EL1, EL2, EL3, EL4
 
     # min_sizes_abs and max_sizes_abs are inspired by the SSD paper (s_k) and anchors.py test logic
     # The following are example absolute pixel values for an image with shorter side 512px
-    # s_min_ratio = 0.10, s_max_ratio = 0.90, num_feature_maps = 6
+    # s_min_ratio = 0.10, s_max_ratio = 0.90, num_feature_maps = 7 (updated)
     # Scales: s_k = s_min + (s_max - s_min) * (k-1) / (m-1)
     # Example values for shorter_side=512:
     # min_sizes_abs: [51.2, 102.4, 153.6, 204.8, 256.0, 307.2] # Placeholder, review and adjust
     # max_sizes_abs is used for the s'_k = sqrt(s_k * s_{k+1}) anchor.
     # This should correspond to the *next* layer's min_size, or a bit larger for the last layer.
     # Example: [102.4, 153.6, 204.8, 256.0, 307.2, 322.56] # Placeholder, review and adjust
-    min_sizes_abs: [51, 102, 153, 204, 256, 307] # Rounded for simplicity
-    max_sizes_abs: [102, 153, 204, 256, 307, 322] # Rounded for simplicity
+    min_sizes_abs: [51, 102, 153, 204, 256, 307, 358] # Extended for 7 levels
+    max_sizes_abs: [102, 153, 204, 256, 307, 322, 370] # Extended for 7 levels
                                                 # Last one is approx. 307 * 1.05
 
-    aspect_ratios: # Aspect ratios (excluding 1.0 which is handled) for each feature map level
-                   # These lists result in [4, 6, 6, 6, 4, 4] anchors per location when combined with defaults
-      - [2.0, 0.5]
-      - [2.0, 0.5, 3.0, 0.3333333333333333] # 1.0/3.0
-      - [2.0, 0.5, 3.0, 0.3333333333333333]
-      - [2.0, 0.5, 3.0, 0.3333333333333333]
-      - [2.0, 0.5]
-      - [2.0, 0.5]
+    aspect_ratios: # Aspect ratios (excluding 1.0 which is handled by AnchorGeneratorSSD defaults) for each feature map level
+                   # These lists, combined with defaults (1.0 ratio anchor and s_k' anchor),
+                   # result in [4, 6, 6, 6, 6, 4, 4] anchors per location.
+                   # Each inner list contains N elements, leading to 2 (base) + N anchors.
+      - [2.0, 0.5]  # 2 + 2 = 4 anchors
+      - [2.0, 0.5, 3.0, 0.3333333333333333]  # 2 + 4 = 6 anchors
+      - [2.0, 0.5, 3.0, 0.3333333333333333]  # 2 + 4 = 6 anchors
+      - [2.0, 0.5, 3.0, 0.3333333333333333]  # 2 + 4 = 6 anchors
+      - [2.0, 0.5, 3.0, 0.3333333333333333]  # 2 + 4 = 6 anchors
+      - [2.0, 0.5]  # 2 + 2 = 4 anchors
+      - [2.0, 0.5]  # 2 + 2 = 4 anchors
     clip: true
     variances: [0.1, 0.1, 0.2, 0.2] # For SSD box encoding/decoding
 
