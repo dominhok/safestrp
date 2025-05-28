@@ -1,0 +1,276 @@
+# SafeStrp - Python Deep Learning Project .gitignore
+
+# ================================
+# Python 관련
+# ================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ================================
+# Virtual Environment
+# ================================
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.local
+.env.*.local
+
+# ================================
+# PyTorch 및 딥러닝 관련
+# ================================
+# 체크포인트 및 모델 파일
+checkpoints/
+*.pth
+*.pt
+*.pkl
+*.model
+*.h5
+*.hdf5
+*.ckpt
+*.pb
+
+# TensorBoard 로그 및 실험 결과
+logs/
+runs/
+tensorboard_logs/
+tb_logs/
+
+# 훈련 관련 임시 파일
+*.log
+training_*.txt
+*.out
+
+# ================================
+# 데이터셋 관련 (전체 제외)
+# ================================
+# 모든 데이터 폴더 제외
+data/
+
+# 데이터 관련 압축 파일
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z
+
+# 이미지 및 비디오 파일 (필요시 주석 해제)
+# *.jpg
+# *.jpeg
+# *.png
+# *.bmp
+# *.tiff
+# *.mp4
+# *.avi
+# *.mov
+
+# ================================
+# IDE 및 에디터 관련
+# ================================
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# ================================
+# 시스템 파일
+# ================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ================================
+# 개발 관련 임시 파일
+# ================================
+# 테스트 및 디버깅
+test_*.py
+debug_*.py
+temp_*.py
+scratch_*.py
+playground_*.py
+
+# 실험 관련
+experiments/
+results/
+outputs/
+wandb/
+
+# 프로파일링
+*.prof
+*.cProfile
+
+# ================================
+# 문서 및 미디어
+# ================================
+# 임시 문서
+*.tmp
+*.bak
+*.backup
+*~
+
+# Office 파일 임시본
+~$*
+.~lock.*
+
+# ================================
+# 네트워크 및 보안
+# ================================
+# API 키 및 설정
+.env.secret
+secrets/
+*.key
+*.pem
+*.crt
+*.p12
+config_secret.py
+
+# ================================
+# 빌드 및 배포
+# ================================
+# Docker
+.dockerignore
+Dockerfile.dev
+docker-compose.override.yml
+
+# 패키징
+*.whl
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ================================
+# SafeStrp 프로젝트 특화
+# ================================
+# 임시 분석 파일들
+*_analysis.py
+*_check.py
+*_test.py
+extract_*.py
+fix_*.py
+create_*.py
+quick_*.py
+
+# 훈련 로그 및 메트릭
+training_log.txt
+metrics.json
+*.metrics
+
+# 모델 변환 결과
+*.onnx
+*.trt
+*.engine
+
+# 시각화 결과
+visualizations/
+plots/
+figures/
+*.png
+*.jpg
+*.gif
+!docs/*.png
+!docs/*.jpg
+!README_assets/
+
+# 캐시 파일
+.cache/
+cache/
+__pycache__/
+
+# 프로파일링 결과
+profile_*.txt
+benchmark_*.txt
+
+# 실험 설정 백업
+configs_backup/
+old_configs/
+
+# ================================
+# 기타
+# ================================
+# 압축 파일
+*.zip
+*.tar
+*.gz
+*.bz2
+*.xz
+
+# 로그 파일
+*.log
+*.log.*
+log/
+
+# Lock 파일
+*.lock
+.lock 
