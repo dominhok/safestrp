@@ -13,10 +13,10 @@ Detection + Surface Segmentation + Depth Estimation을 위한 멀티태스크 �
 
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, Any
 
 from .backbone import DSPNetBackbone
-from .heads import MultiTaskDetectionHead, PyramidPoolingSegmentationHead, DepthRegressionHead
+from ..heads import MultiTaskDetectionHead, PyramidPoolingSegmentationHead, DepthRegressionHead, CrossTaskProjectionHead
 from .anchors import SSDanchorGenerator
 
 
@@ -29,15 +29,18 @@ class ThreeTaskDSPNet(nn.Module):
     - Detection Head: SSD-style object detection (bbox only, no distance)
     - Surface Head: FCN-style semantic segmentation
     - Depth Head: Dense depth regression
+    - Cross-Task Projection: MTPSL-style consistency between Seg and Depth
     
     이 모델은 Detection + Surface Segmentation + Depth Estimation 3태스크를 동시에 수행합니다.
+    UberNet 방식의 partial label handling과 MTPSL 방식의 cross-task consistency를 지원합니다.
     """
     
     def __init__(self,
                  num_detection_classes: int = 29,
                  num_surface_classes: int = 7,
                  input_size: Tuple[int, int] = (512, 512),
-                 pretrained_backbone: bool = True):
+                 pretrained_backbone: bool = True,
+                 enable_cross_task_consistency: bool = True):
         """
         Initialize ThreeTaskDSPNet.
         
@@ -46,12 +49,14 @@ class ThreeTaskDSPNet(nn.Module):
             num_surface_classes: Number of surface segmentation classes (7 surfaces)
             input_size: Input image size (H, W)
             pretrained_backbone: Whether to use pretrained ResNet backbone
+            enable_cross_task_consistency: Whether to enable MTPSL cross-task consistency
         """
         super(ThreeTaskDSPNet, self).__init__()
         
         self.num_detection_classes = num_detection_classes
         self.num_surface_classes = num_surface_classes
         self.input_size = input_size
+        self.enable_cross_task_consistency = enable_cross_task_consistency
         
         # Shared backbone for feature extraction
         self.backbone = DSPNetBackbone(pretrained=pretrained_backbone)
@@ -94,9 +99,20 @@ class ThreeTaskDSPNet(nn.Module):
         )
         
         self.depth_head = DepthRegressionHead(
-            input_channels=2048,  # Assuming the last layer of ResNet-50 is 2048 channels
-            output_channels=1    # Output channels for depth regression
+            c3_channels=512,   # ResNet-50 C3 output channels
+            c4_channels=1024,  # ResNet-50 C4 output channels  
+            c5_channels=2048,  # ResNet-50 C5 output channels
+            output_channels=1  # Depth output channels
         )
+        
+        # **NEW: MTPSL Cross-Task Projection Heads**
+        if self.enable_cross_task_consistency:
+            self.cross_task_heads = CrossTaskProjectionHead(
+                seg_channels=num_surface_classes,
+                depth_channels=1,
+                embedding_dim=512,
+                input_size=input_size
+            )
         
         # **NEW: Pre-generate anchors for efficiency**
         self._anchors = None
@@ -112,6 +128,7 @@ class ThreeTaskDSPNet(nn.Module):
         print(f"   입력 크기: {input_size}")
         print(f"   **SSD Anchors**: {self._anchors.shape[0]:,}개 생성")
         print(f"   Pretrained 백본: {pretrained_backbone}")
+        print(f"   **Cross-Task Consistency**: {enable_cross_task_consistency}")
     
     def _generate_anchors(self):
         """Pre-generate anchors for efficiency."""
@@ -135,41 +152,161 @@ class ThreeTaskDSPNet(nn.Module):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
     
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, targets: Optional[Dict] = None, task_mask: Optional[Dict] = None) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through the three-task network.
+        UberNet-style forward pass - 필요한 태스크만 계산.
         
         Args:
-            x: Input tensor (B, 3, H, W)
+            x: Input images (B, 3, H, W)
+            targets: Optional target data for GT embeddings in cross-task consistency
+            task_mask: Dictionary indicating which tasks to compute
             
         Returns:
-            Dictionary containing outputs from all tasks:
-            - 'detection_cls': Classification predictions (B, num_anchors, num_classes)
-            - 'detection_reg': Regression predictions (B, num_anchors, 4)  # bbox(4)
-            - 'surface_segmentation': Segmentation predictions (B, num_classes, H, W)
-            - 'depth_estimation': Depth predictions (B, 1, H, W)
-            - 'anchors': Anchor boxes (num_anchors, 4) [x1, y1, x2, y2]
+            Dictionary containing only requested task predictions and cross-task embeddings
         """
-        # Extract multi-scale features from shared backbone
-        features = self.backbone(x)  # Returns [C3, C4, C5]
-        c3_feat, c4_feat, c5_feat = features[0], features[1], features[2]
+        # Task mask 기본값 (모든 태스크 계산)
+        if task_mask is None:
+            task_mask = {'detection': True, 'surface': True, 'depth': True}
         
-        # Object detection (classification + bbox regression)
-        detection_cls, detection_reg = self.detection_head(c3_feat, c4_feat, c5_feat)
+        # Extract backbone features (항상 필요)
+        features = self._extract_backbone_features(x)
         
-        # Surface segmentation
-        surface_segmentation = self.surface_head(c3_feat, c4_feat, c5_feat)
+        # UberNet 방식: 필요한 태스크만 계산
+        task_outputs = self._generate_selective_task_predictions(features, task_mask)
         
-        # Depth estimation
-        depth_estimation = self.depth_head(c5_feat)
+        # Generate cross-task embeddings if enabled and relevant tasks are computed
+        cross_task_outputs = self._generate_cross_task_embeddings(
+            task_outputs, targets, task_mask
+        )
         
-        return {
-            'detection_cls': detection_cls,
-            'detection_reg': detection_reg,
-            'surface_segmentation': surface_segmentation,
-            'depth_estimation': depth_estimation,
-            'anchors': self._anchors  # **NEW: Include pre-generated anchors**
+        # Combine outputs
+        outputs = {
+            'backbone_features': features,
+            **task_outputs,
+            **cross_task_outputs
         }
+        
+        return outputs
+    
+    def _extract_backbone_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract multi-scale features from backbone.
+        
+        Args:
+            x: Input images (B, 3, H, W)
+            
+        Returns:
+            Tuple of (C3, C4, C5) features
+        """
+        return self.backbone.extract_features(x)
+    
+    def _generate_selective_task_predictions(self, 
+                                           features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                                           task_mask: Dict[str, bool]) -> Dict[str, torch.Tensor]:
+        """
+        Modified UberNet + Cross-task Consistency 방식:
+        - 필요한 태스크만 계산 (UberNet)
+        - surface 또는 depth 중 하나라도 있으면 둘 다 계산 (Cross-task Consistency)
+        
+        Args:
+            features: Tuple of (C3, C4, C5) backbone features
+            task_mask: Which tasks to compute
+            
+        Returns:
+            Dictionary containing requested task predictions
+        """
+        task_outputs = {}
+        
+        # Detection predictions (only if needed - 독립적)
+        if task_mask.get('detection', False):
+            det_cls, det_reg = self.detection_head(*features)
+            task_outputs.update({
+                'detection_cls': det_cls,
+                'detection_reg': det_reg
+            })
+        
+        # 🌉 Cross-task Consistency 로직: surface 또는 depth 중 하나라도 있으면 둘 다 계산
+        has_surface_label = task_mask.get('surface', False)
+        has_depth_label = task_mask.get('depth', False)
+        need_cross_task = has_surface_label or has_depth_label
+        
+        if need_cross_task and self.enable_cross_task_consistency:
+            # Surface와 Depth를 모두 계산 (cross-task consistency를 위해)
+            surface_logits = self.surface_head(*features)
+            depth_pred = self.depth_head(*features)
+            
+            task_outputs.update({
+                'surface_segmentation': surface_logits,
+                'depth_estimation': depth_pred,
+                # 라벨 정보 전달 (loss 계산에서 사용)
+                'has_surface_label': has_surface_label,
+                'has_depth_label': has_depth_label
+            })
+        else:
+            # Cross-task consistency 비활성화된 경우 - 기존 UberNet 방식
+            if has_surface_label:
+                surface_logits = self.surface_head(*features)
+                task_outputs['surface_segmentation'] = surface_logits
+            
+            if has_depth_label:
+                depth_pred = self.depth_head(*features)
+                task_outputs['depth_estimation'] = depth_pred
+        
+        return task_outputs
+    
+    def _generate_cross_task_embeddings(self, 
+                                       task_outputs: Dict[str, torch.Tensor],
+                                       targets: Optional[Dict] = None,
+                                       task_mask: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Modified Cross-task Consistency: surface 또는 depth 중 하나라도 있으면 계산.
+        
+        Args:
+            task_outputs: Dictionary containing task predictions
+            targets: Optional target data for GT embeddings
+            task_mask: Which tasks were computed
+            
+        Returns:
+            Dictionary containing cross-task related outputs
+        """
+        if not self.enable_cross_task_consistency:
+            return {
+                'cross_task_embeddings': {},
+                'active_task_pairs': []
+            }
+        
+        # 🌉 Modified Cross-task Consistency: surface 또는 depth 중 하나라도 있으면 계산
+        has_surface_or_depth = (task_mask and 
+                               (task_mask.get('surface', False) or task_mask.get('depth', False)))
+        
+        if (has_surface_or_depth and
+            'surface_segmentation' in task_outputs and
+            'depth_estimation' in task_outputs):
+            
+            # Generate prediction embeddings (항상 계산 가능)
+            cross_task_embeddings = self.cross_task_heads(
+                seg_pred=task_outputs['surface_segmentation'],
+                depth_pred=task_outputs['depth_estimation']
+            )
+            
+            # Add GT embeddings if targets are provided
+            if targets is not None:
+                gt_embeddings = self.cross_task_heads.compute_gt_embeddings(targets)
+                cross_task_embeddings.update(gt_embeddings)
+            
+            # 라벨 정보 추가 (loss 계산에서 사용)
+            cross_task_embeddings['has_surface_label'] = task_outputs.get('has_surface_label', False)
+            cross_task_embeddings['has_depth_label'] = task_outputs.get('has_depth_label', False)
+            
+            return {
+                'cross_task_embeddings': cross_task_embeddings,
+                'active_task_pairs': self.cross_task_heads.get_active_pairs()
+            }
+        else:
+            return {
+                'cross_task_embeddings': {},
+                'active_task_pairs': []
+            }
     
     def get_model_info(self) -> Dict:
         """Get comprehensive model information."""
@@ -256,7 +393,8 @@ def create_model(config: Dict = None) -> ThreeTaskDSPNet:
         num_detection_classes=config.get('num_detection_classes', 29),
         num_surface_classes=config.get('num_surface_classes', 7),
         input_size=config.get('input_size', (512, 512)),
-        pretrained_backbone=config.get('pretrained_backbone', True)
+        pretrained_backbone=config.get('pretrained_backbone', True),
+        enable_cross_task_consistency=config.get('enable_cross_task_consistency', True)
     )
     
     return model

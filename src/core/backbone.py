@@ -70,6 +70,23 @@ class DSPNetBackbone(nn.Module):
 
         return c3_feat, c4_feat, c5_feat
 
+    def extract_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract multi-scale features from input image.
+        
+        This is an alias for forward() method to maintain compatibility.
+        
+        Args:
+            x: Input tensor of shape (B, 3, H, W)
+            
+        Returns:
+            tuple: (c3_feat, c4_feat, c5_feat)
+                - c3_feat: (B, 512, H/8, W/8)
+                - c4_feat: (B, 1024, H/16, W/16)
+                - c5_feat: (B, 2048, H/32, W/32)
+        """
+        return self.forward(x)
+
     def get_feature_channels(self) -> dict[str, int]:
         """Get output channel numbers for each feature level."""
         return {

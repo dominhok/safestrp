@@ -19,13 +19,13 @@ import argparse
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-# 새로운 YAML config 시스템
+# 리팩토링된 구조에 맞는 YAML config 시스템
 from configs.yaml_config import load_training_config, save_config, quick_config
 
-# 기존 모듈들
-from src.model import ThreeTaskDSPNet
-from src.losses import SimpleTwoTaskLoss
-from utils.dataset import create_dataset
+# 리팩토링된 구조에 맞는 import
+from src.core.model import ThreeTaskDSPNet
+from src.losses.multitask import SimpleTwoTaskLoss
+from src.data.loaders import create_dataset
 
 
 class YAMLTrainer:

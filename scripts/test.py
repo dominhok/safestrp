@@ -20,9 +20,10 @@ from tqdm import tqdm
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-# 새로운 구조에 맞는 import
-from src.model import ThreeTaskDSPNet, load_pretrained_model
-from utils.dataset import create_dataset, DETECTION_CLASSES, SURFACE_LABELS
+# 리팩토링된 구조에 맞는 import
+from src.core.model import ThreeTaskDSPNet
+from src.data.loaders import create_dataset
+from src.data import DETECTION_CLASSES, SURFACE_LABELS
 from configs.config import Config
 
 

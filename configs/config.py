@@ -208,7 +208,7 @@ def get_massive_dataset_config() -> Config:
     config.dataset.batch_size = 24
     config.dataset.num_workers = 12
     config.dataset.max_samples = 5000000  # 5M samples
-    config.dataset.use_depth = False  # 임시로 Depth 데이터 비활성화
+    config.dataset.use_depth = True  # ✅ Depth 데이터 활성화 (3개 태스크 모두 사용)
     config.dataset.camera_type = "2K"  # 카메라 타입
     
     # Training settings
@@ -274,6 +274,93 @@ def get_massive_dataset_config() -> Config:
     print(f"   에폭: {config.training.epochs}")
     print(f"   혼합 정밀도: {config.training.use_amp}")
     print(f"   Depth 사용: {config.dataset.use_depth}")
+    
+    return config
+
+
+def get_subset_training_config() -> Config:
+    """부분 데이터셋으로 훈련하기 위한 설정 (시스템 테스트용)"""
+    config = Config()
+    
+    # Dataset settings - 일부만 사용
+    config.dataset = SimpleNamespace()
+    config.dataset.base_dir = "data/full_dataset"  # 전체 데이터셋 경로
+    config.dataset.batch_size = 8  # 작은 배치 크기
+    config.dataset.num_workers = 4  # 적은 워커
+    config.dataset.max_samples = 1000  # ✅ 각 태스크당 최대 1000개만 사용
+    config.dataset.use_depth = True  # 3개 태스크 모두 사용
+    config.dataset.camera_type = "2K"
+    
+    # Training settings - 빠른 훈련
+    config.training = SimpleNamespace()
+    config.training.epochs = 10  # 짧은 에폭
+    config.training.learning_rate = 1e-4  # 적당한 학습률
+    config.training.weight_decay = 1e-4
+    config.training.patience = 5  # 짧은 patience
+    config.training.use_amp = True  # Mixed Precision 사용
+    config.training.gradient_clip = 1.0
+    config.training.max_grad_norm = 1.0
+    config.training.val_frequency = 1  # 매 에폭마다 검증
+    config.training.save_frequency = 2  # 자주 저장
+    
+    # Model settings
+    config.model = SimpleNamespace()
+    config.model.input_size = (512, 512)
+    config.model.num_classes = 29
+    config.model.surface_classes = 7
+    config.model.backbone = 'resnet50'
+    config.model.pretrained = True
+    
+    # Loss settings
+    config.loss = SimpleNamespace()
+    config.loss.detection_weight = 1.0
+    config.loss.surface_weight = 1.0
+    config.loss.depth_weight = 1.0
+    config.loss.cross_task_weight = 0.1  # Cross-task consistency
+    config.loss.use_advanced = True
+    config.loss.neg_pos_ratio = 3.0
+    
+    # System settings - 메모리 효율성
+    config.system = SimpleNamespace()
+    config.system.device = "auto"
+    config.system.mixed_precision = True
+    config.system.pin_memory = True
+    config.system.non_blocking = True
+    config.system.seed = 42
+    config.system.print_frequency = 10
+    config.system.save_best_only = True
+    config.system.save_last = True
+    
+    # Data settings
+    config.data = SimpleNamespace()
+    config.data.base_dir = config.dataset.base_dir
+    config.data.checkpoint_dir = "checkpoints/subset_training"  # 별도 폴더
+    config.data.log_dir = "logs/subset_training"
+    
+    # Optimizer settings
+    config.optimizer = SimpleNamespace()
+    config.optimizer.type = 'AdamW'
+    config.optimizer.lr = config.training.learning_rate
+    config.optimizer.weight_decay = config.training.weight_decay
+    config.optimizer.betas = (0.9, 0.999)
+    
+    # Scheduler settings
+    config.scheduler = SimpleNamespace()
+    config.scheduler.type = 'ReduceLROnPlateau'
+    config.scheduler.factor = 0.5
+    config.scheduler.patience = 3  # 짧은 patience
+    config.scheduler.min_lr = 1e-7
+    
+    print("🚀 부분 데이터셋 훈련 설정 로드:")
+    print(f"   데이터 경로: {config.dataset.base_dir}")
+    print(f"   배치 크기: {config.dataset.batch_size}")
+    print(f"   최대 샘플: {config.dataset.max_samples:,}개 (각 태스크)")
+    print(f"   작업자 수: {config.dataset.num_workers}")
+    print(f"   학습률: {config.training.learning_rate}")
+    print(f"   에폭: {config.training.epochs}")
+    print(f"   혼합 정밀도: {config.training.use_amp}")
+    print(f"   Depth 사용: {config.dataset.use_depth}")
+    print(f"   체크포인트: {config.data.checkpoint_dir}")
     
     return config
 
