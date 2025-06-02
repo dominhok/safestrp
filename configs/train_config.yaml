@@ -1,0 +1,56 @@
+# SafeStrp Training Configuration
+# 핵심 설정만 컨트롤하는 깔끔한 config
+
+# 모델 구조
+model:
+  num_detection_classes: 29
+  num_surface_classes: 7
+  input_size: [512, 512]
+  pretrained_backbone: true
+
+# 훈련 설정
+training:
+  epochs: 100
+  batch_size: 8
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  
+  # 손실 가중치
+  loss_weights:
+    detection: 1.0
+    surface: 1.0
+    depth: 0.5
+  
+  # 옵티마이저
+  optimizer: "AdamW"
+  scheduler: "ReduceLROnPlateau"
+  patience: 10
+  
+  # 그래디언트
+  max_grad_norm: 1.0
+  mixed_precision: true
+
+# 데이터셋
+dataset:
+  base_dir: "data/original_dataset"
+  max_samples: 2000
+  val_split: 0.2
+  
+# 시스템
+system:
+  num_workers: 4
+  pin_memory: false
+  non_blocking: true
+  device: "auto"  # auto, cuda, cpu
+
+# 체크포인트
+checkpoint:
+  save_dir: "checkpoints"
+  save_interval: 10
+  keep_best: true
+  
+# 로깅
+logging:
+  log_dir: "logs"
+  tensorboard: true
+  print_interval: 50 

@@ -21,7 +21,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 # 새로운 구조에 맞는 import
-from src.model import TwoTaskDSPNet
+from src.model import ThreeTaskDSPNet
 from src.losses import SimpleTwoTaskLoss, AdvancedTwoTaskLoss
 from utils.dataset import create_massive_dataset
 from configs.config import Config, get_quick_test_config, get_full_training_config, get_massive_dataset_config
@@ -62,17 +62,17 @@ class TwoTaskTrainer:
             # massive_dataset_config 사용시
             detection_weight = getattr(self.config.loss, 'detection_weight', 1.0)
             surface_weight = getattr(self.config.loss, 'surface_weight', 1.0)
-            distance_weight = getattr(self.config.loss, 'distance_weight', 0.5)
+            depth_weight = getattr(self.config.loss, 'depth_weight', 0.5)
         else:
             # 기본 Config 클래스 사용시
             detection_weight = self.config.training.detection_weight
             surface_weight = self.config.training.surface_weight
-            distance_weight = self.config.training.distance_weight
+            depth_weight = self.config.training.depth_weight
             
         self.criterion = SimpleTwoTaskLoss(
             detection_weight=detection_weight,
             surface_weight=surface_weight,
-            distance_weight=distance_weight
+            distance_weight=depth_weight
         )
         
         # 디렉토리 생성 - config 구조에 따라 다르게 접근
@@ -128,10 +128,12 @@ class TwoTaskTrainer:
         
         return device
     
-    def _create_model(self) -> TwoTaskDSPNet:
-        """Create model based on configuration."""
+    def _create_model(self) -> ThreeTaskDSPNet:
+        """Create and initialize the model."""
+        print(f"📦 모델 생성 중...")
+        
         # config 구조에 따라 다르게 접근
-        if hasattr(self.config, 'model') and hasattr(self.config.model, 'num_detection_classes'):
+        if hasattr(self.config, 'model'):
             # 기본 Config 클래스 사용시
             num_detection_classes = self.config.model.num_detection_classes
             num_surface_classes = self.config.model.num_surface_classes
@@ -144,7 +146,7 @@ class TwoTaskTrainer:
             input_size = getattr(self.config.model, 'input_size', (512, 512))
             pretrained_backbone = getattr(self.config.model, 'pretrained', True)
         
-        model = TwoTaskDSPNet(
+        model = ThreeTaskDSPNet(
             num_detection_classes=num_detection_classes,
             num_surface_classes=num_surface_classes,
             input_size=input_size,
@@ -358,7 +360,7 @@ class TwoTaskTrainer:
             processed_boxes = []
             for boxes in detection_boxes_list:
                 if torch.is_tensor(boxes):
-                    # 6차원에서 4차원 bbox만 추출: [x1, y1, x2, y2, class_id, distance] -> [x1, y1, x2, y2]
+                    # 5차원에서 4차원 bbox만 추출: [x1, y1, x2, y2, class_id] -> [x1, y1, x2, y2]
                     if boxes.size(-1) >= 4:
                         bbox_only = boxes[:, :4]  # 첫 4개 차원만 사용
                         processed_boxes.append(bbox_only.to(
@@ -383,8 +385,8 @@ class TwoTaskTrainer:
         if 'detection_boxes' in batch:
             detection_labels_list = []
             for boxes in batch['detection_boxes']:
-                if torch.is_tensor(boxes) and boxes.size(-1) >= 6:
-                    # boxes 형태: [x1, y1, x2, y2, class_id, distance]
+                if torch.is_tensor(boxes) and boxes.size(-1) >= 5:
+                    # boxes 형태: [x1, y1, x2, y2, class_id] - 5차원 데이터
                     labels = boxes[:, 4].long()  # 클래스 ID 추출
                     detection_labels_list.append(labels.to(
                         self.device, non_blocking=self.config.system.non_blocking
@@ -395,13 +397,14 @@ class TwoTaskTrainer:
             
             targets['detection_labels'] = detection_labels_list
         
-        # Distance targets도 boxes에서 추출
+        # Distance targets는 현재 데이터에 없으므로 제거하거나 기본값 사용
+        # 실제 데이터는 [x1, y1, x2, y2, class_id] 5차원이므로 distance 정보 없음
         if 'detection_boxes' in batch:
             detection_distances_list = []
             for boxes in batch['detection_boxes']:
-                if torch.is_tensor(boxes) and boxes.size(-1) >= 6:
-                    # boxes 형태: [x1, y1, x2, y2, class_id, distance]
-                    distances = boxes[:, 5]  # distance 추출
+                if torch.is_tensor(boxes) and boxes.size(0) > 0:
+                    # Distance 정보가 없으므로 기본값 0.0으로 설정
+                    distances = torch.zeros(boxes.size(0), dtype=torch.float32)
                     detection_distances_list.append(distances.to(
                         self.device, non_blocking=self.config.system.non_blocking
                     ))

@@ -1,7 +1,7 @@
 """
-Configuration Settings for TwoTaskDSPNet
+Configuration Settings for ThreeTaskDSPNet
 
-모든 하이퍼파라미터와 설정값들을 한 곳에서 관리합니다.
+Detection + Surface + Depth 3태스크 멀티태스크 학습을 위한 모든 하이퍼파라미터와 설정값들을 한 곳에서 관리합니다.
 """
 
 from dataclasses import dataclass
@@ -42,10 +42,10 @@ class TrainingConfig:
     train_ratio: float = 0.8
     num_workers: int = 2
     
-    # Loss weights
+    # 3태스크 Loss weights
     detection_weight: float = 1.0
     surface_weight: float = 2.0
-    distance_weight: float = 0.5
+    depth_weight: float = 1.0  # depth_weight로 변경 (distance_weight에서)
     
     # Optimizer and scheduler
     optimizer_type: str = "adamw"  # "adam", "adamw", "sgd"
@@ -226,8 +226,8 @@ def get_massive_dataset_config() -> Config:
     # Model settings
     config.model = SimpleNamespace()
     config.model.input_size = (512, 512)
-    config.model.num_classes = 27  # Detection classes
-    config.model.surface_classes = 4  # Surface classes
+    config.model.num_classes = 29  # Detection classes
+    config.model.surface_classes = 7  # Surface classes
     config.model.backbone = 'resnet50'
     config.model.pretrained = True
     
@@ -235,7 +235,6 @@ def get_massive_dataset_config() -> Config:
     config.loss = SimpleNamespace()
     config.loss.detection_weight = 1.0
     config.loss.surface_weight = 1.0
-    config.loss.distance_weight = 0.5
     config.loss.depth_weight = 1.0  # Depth 손실 가중치
     config.loss.use_advanced = True  # Advanced loss with IoU matching
     config.loss.neg_pos_ratio = 3.0  # Hard negative mining ratio

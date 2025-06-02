@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-TwoTaskDSPNet Testing Script
+ThreeTaskDSPNet Testing Script
 
-훈련된 모델의 성능을 테스트하고 시각화합니다.
+Detection + Surface + Depth 3태스크 모델의 성능을 테스트하고 결과를 시각화합니다.
 """
 
 import os
@@ -21,8 +21,8 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 # 새로운 구조에 맞는 import
-from src.model import TwoTaskDSPNet, load_pretrained_model
-from utils.dataset import create_dataloaders, DETECTION_CLASSES, SURFACE_CLASS_MAPPING
+from src.model import ThreeTaskDSPNet, load_pretrained_model
+from utils.dataset import create_dataset, DETECTION_CLASSES, SURFACE_LABELS
 from configs.config import Config
 
 
@@ -32,7 +32,7 @@ class ModelTester:
     """
     
     def __init__(self, checkpoint_path: str, device: str = 'auto'):
-    """
+        """
         Initialize model tester.
         
         Args:
@@ -64,14 +64,44 @@ class ModelTester:
         
         return device
     
-    def _load_model(self, checkpoint_path: str) -> TwoTaskDSPNet:
-        """Load trained model."""
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"체크포인트 파일을 찾을 수 없습니다: {checkpoint_path}")
+    def _load_model(self, checkpoint_path: str) -> ThreeTaskDSPNet:
+        """
+        Load model from checkpoint.
         
-        model = load_pretrained_model(checkpoint_path, self.device)
+        Args:
+            checkpoint_path: Path to model checkpoint
+            
+        Returns:
+            Loaded model
+        """
+        print(f"📂 모델 로딩: {checkpoint_path}")
+        
+        # Check if checkpoint exists
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Create model with same config as training
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            model = ThreeTaskDSPNet(
+                num_detection_classes=config.get('num_detection_classes', 29),
+                num_surface_classes=config.get('num_surface_classes', 7),
+                input_size=config.get('input_size', (512, 512)),
+                pretrained_backbone=config.get('pretrained_backbone', True)
+            )
+        else:
+            # Default config
+            model = ThreeTaskDSPNet()
+        
+        # Load state dict
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(self.device)
         model.eval()
         
+        print(f"✅ 모델 로드 완료")
         return model
     
     def test_single_image(self, image_path: str, save_path: str = None) -> dict:
@@ -120,14 +150,14 @@ class ModelTester:
         """Process model outputs."""
         results = {'image_path': image_path}
         
-        # Detection 결과 처리
+        # Detection 결과 처리 - 새로운 SSD 표준 형태
         detection_cls = outputs['detection_cls']  # (1, num_anchors, num_classes+1)
-        detection_reg = outputs['detection_reg']  # (1, num_anchors, 5)
+        detection_reg = outputs['detection_reg']  # (1, num_anchors, 4)
         
-        # Softmax for classification scores
-        detection_scores = F.softmax(detection_cls[0], dim=-1)
+        # Softmax for classification scores (background 포함)
+        detection_scores = F.softmax(detection_cls[0], dim=-1)  # (num_anchors, num_classes+1)
         
-        # 상위 예측 선택 (간단한 방법)
+        # 배경이 아닌 클래스의 최대값 선택
         max_scores, predicted_classes = torch.max(detection_scores[:, 1:], dim=-1)  # background 제외
         predicted_classes += 1  # background 제외했으므로 +1
         
@@ -139,13 +169,11 @@ class ModelTester:
             valid_scores = max_scores[valid_indices]
             valid_classes = predicted_classes[valid_indices]
             valid_boxes = detection_reg[0, valid_indices, :4]  # bbox coordinates
-            valid_distances = detection_reg[0, valid_indices, 4]  # distances
             
             results['detections'] = {
                 'scores': valid_scores.cpu().numpy(),
                 'classes': valid_classes.cpu().numpy(), 
                 'boxes': valid_boxes.cpu().numpy(),
-                'distances': valid_distances.cpu().numpy(),
                 'count': len(valid_scores)
             }
         else:
@@ -153,7 +181,6 @@ class ModelTester:
                 'scores': np.array([]),
                 'classes': np.array([]),
                 'boxes': np.array([]).reshape(0, 4),
-                'distances': np.array([]),
                 'count': 0
             }
         
@@ -190,7 +217,6 @@ class ModelTester:
                 score = detections['scores'][i]
                 class_id = detections['classes'][i] - 1  # 0-based indexing
                 box = detections['boxes'][i]
-                distance = detections['distances'][i]
                 
                 if 0 <= class_id < len(DETECTION_CLASSES):
                     class_name = DETECTION_CLASSES[class_id]
@@ -202,7 +228,7 @@ class ModelTester:
                     cv2.rectangle(detection_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     
                     # 라벨 텍스트
-                    label = f'{class_name}: {score:.2f} ({distance:.1f}m)'
+                    label = f'{class_name}: {score:.2f}'
                     cv2.putText(detection_img, label, (x1, y1-10), 
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         
@@ -339,7 +365,7 @@ def main():
         print(f"\n📚 데이터셋 테스트 ({args.num_samples}개 샘플)")
         
         # 데이터 로더 생성
-        _, val_loader = create_dataloaders(
+        _, val_loader = create_dataset(
             batch_size=4,
             num_workers=2,
             max_samples=args.num_samples * 2,
